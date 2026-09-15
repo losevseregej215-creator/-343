@@ -45,21 +45,29 @@ def is_admin(uid):
 
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
+# ============================================================
+#   ЕДИНСТВЕННЫЙ путь к базе: <папка main.py>/data/NailsLab.db
+# ============================================================
 DB_DIR = os.path.join(BASE_DIR, "data")
+DB_PATH = os.path.join(DB_DIR, "NailsLab.db")
+
 os.makedirs(DB_DIR, exist_ok=True)
-DB_PATH = os.path.join(DB_DIR, "bot.db")
-print(f"[BOOT] BASE_DIR: {BASE_DIR}")
-print(f"[BOOT] DB_PATH:  {DB_PATH}")
+
+print("=" * 60)
+print(f"[BOOT] BASE_DIR:  {BASE_DIR}")
+print(f"[BOOT] DB_DIR:    {DB_DIR}")
+print(f"[BOOT] DB_PATH:   {DB_PATH}")
 
 if not os.path.exists(DB_PATH):
-    print(f"[BOOT] Базы нет — создаю: {DB_PATH}")
+    print(f"[BOOT] Файла нет — создаю пустой NailsLab.db")
     open(DB_PATH, "a").close()
 else:
-    print(f"[BOOT] База найдена: {DB_PATH}")
+    print(f"[BOOT] Файл существует ({os.path.getsize(DB_PATH)} байт)")
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.row_factory = sqlite3.Row
 router = Router()
+print("=" * 60)
 
 WELCOME_TEXT = (
     "Здравствуйте! 💅\n\n"
@@ -106,8 +114,11 @@ def init_db():
                  "slot_id INTEGER, month_id INTEGER, "
                  "status TEXT, reason TEXT, created_at TEXT)")
     conn.commit()
-    m = db_one("SELECT COUNT(*) AS c FROM months")
-    print(f"[BOOT] Месяцев в базе: {m['c'] if m else 0}")
+
+    m = db_all("SELECT * FROM months ORDER BY year, month_num")
+    print(f"[BOOT] Месяцев в базе: {len(m)}")
+    for row in m:
+        print(f"        • {row['name']} {row['year']} (id={row['id']})")
 
 
 def db_exec(q, p=()):
@@ -139,8 +150,6 @@ def get_welcome_text():
 
 
 def get_welcome_photos():
-    """Возвращает список file_id от админа, либо None, если фото не заданы.
-    Пустой список трактуется как None, чтобы бот использовал локальные photo1-3."""
     row = db_one("SELECT value FROM settings WHERE key='welcome_photos'")
     if row is None:
         return None
@@ -293,16 +302,7 @@ def admin_month_menu_kb():
 
 
 def _find_local_welcome_files():
-    """Ищет photo1/2/3 рядом с main.py и в подпапках."""
-    search_dirs = [
-        BASE_DIR,
-        os.path.join(BASE_DIR, "app"),
-        os.path.join(BASE_DIR, "data"),
-        os.path.join(BASE_DIR, "files"),
-        os.path.join(BASE_DIR, "media"),
-        os.getcwd(),
-    ]
-    # Убираем дубли путей
+    search_dirs = [BASE_DIR, os.getcwd(), DB_DIR]
     seen = set()
     dirs = []
     for d in search_dirs:
@@ -324,7 +324,7 @@ def _find_local_welcome_files():
             if found:
                 break
     if not paths:
-        print(f"[WELCOME] Локальных photo1/2/3 не найдено. Проверял в: {dirs}")
+        print(f"[WELCOME] Локальных photo1/2/3 не найдено. Проверял: {dirs}")
     return paths
 
 
