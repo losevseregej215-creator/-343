@@ -44,7 +44,20 @@ def is_admin(uid):
 
 
 scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-conn = sqlite3.connect(os.path.join(BASE_DIR, "bot.db"), check_same_thread=False)
+
+DB_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DB_DIR, exist_ok=True)
+DB_PATH = os.path.join(DB_DIR, "bot.db")
+print(f"[BOOT] BASE_DIR: {BASE_DIR}")
+print(f"[BOOT] DB_PATH:  {DB_PATH}")
+
+if not os.path.exists(DB_PATH):
+    print(f"[BOOT] Базы нет — создаю: {DB_PATH}")
+    open(DB_PATH, "a").close()
+else:
+    print(f"[BOOT] База найдена: {DB_PATH}")
+
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.row_factory = sqlite3.Row
 router = Router()
 
@@ -93,6 +106,8 @@ def init_db():
                  "slot_id INTEGER, month_id INTEGER, "
                  "status TEXT, reason TEXT, created_at TEXT)")
     conn.commit()
+    m = db_one("SELECT COUNT(*) AS c FROM months")
+    print(f"[BOOT] Месяцев в базе: {m['c'] if m else 0}")
 
 
 def db_exec(q, p=()):
@@ -124,13 +139,18 @@ def get_welcome_text():
 
 
 def get_welcome_photos():
+    """Возвращает список file_id от админа, либо None, если фото не заданы.
+    Пустой список трактуется как None, чтобы бот использовал локальные photo1-3."""
     row = db_one("SELECT value FROM settings WHERE key='welcome_photos'")
     if row is None:
         return None
     try:
-        return json.loads(row["value"])
+        val = json.loads(row["value"])
     except Exception:
         return None
+    if not isinstance(val, list) or len(val) == 0:
+        return None
+    return val
 
 
 async def resolve_username(bot, uid, cached=None):
@@ -272,26 +292,92 @@ def admin_month_menu_kb():
     ], resize_keyboard=True)
 
 
+def _find_local_welcome_files():
+    """Ищет photo1/2/3 рядом с main.py и в подпапках."""
+    search_dirs = [
+        BASE_DIR,
+        os.path.join(BASE_DIR, "app"),
+        os.path.join(BASE_DIR, "data"),
+        os.path.join(BASE_DIR, "files"),
+        os.path.join(BASE_DIR, "media"),
+        os.getcwd(),
+    ]
+    # Убираем дубли путей
+    seen = set()
+    dirs = []
+    for d in search_dirs:
+        if d not in seen:
+            seen.add(d)
+            dirs.append(d)
+
+    paths = []
+    for base in ("photo1", "photo2", "photo3"):
+        for d in dirs:
+            found = False
+            for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
+                path = os.path.join(d, base + ext)
+                if os.path.exists(path):
+                    paths.append(path)
+                    print(f"[WELCOME] Нашёл фото: {path}")
+                    found = True
+                    break
+            if found:
+                break
+    if not paths:
+        print(f"[WELCOME] Локальных photo1/2/3 не найдено. Проверял в: {dirs}")
+    return paths
+
+
 async def send_welcome(message: Message):
     text = get_welcome_text()
     file_ids = get_welcome_photos()
-    media = []
+    print(f"[WELCOME] file_ids из базы: {file_ids}")
+
+    sources = []
     if file_ids is None:
-        for fname in ("photo1.jpg", "photo2.jpg", "photo3.jpg"):
-            path = os.path.join(BASE_DIR, fname)
-            if os.path.exists(path):
-                media.append(InputMediaPhoto(media=FSInputFile(path)))
+        for path in _find_local_welcome_files():
+            sources.append(FSInputFile(path))
     else:
         for fid in file_ids:
-            media.append(InputMediaPhoto(media=fid))
-    if media:
-        media[0].caption = text
+            sources.append(fid)
+
+    print(f"[WELCOME] Источников: {len(sources)}")
+
+    if not sources:
+        await message.answer(text)
+        return
+
+    if len(sources) == 1:
         try:
-            await message.answer_media_group(media=media)
+            await message.answer_photo(photo=sources[0], caption=text)
+            print("[WELCOME] Одно фото отправлено")
             return
         except Exception as e:
-            print(f"welcome media error: {e}")
-    await message.answer(text)
+            print(f"[WELCOME] Ошибка отправки одного фото: {e}")
+        await message.answer(text)
+        return
+
+    try:
+        media = [InputMediaPhoto(media=s) for s in sources]
+        media[0].caption = text
+        await message.answer_media_group(media=media)
+        return
+    except Exception as e:
+        print(f"[WELCOME] Ошибка media_group: {e}")
+
+    first = True
+    for s in sources:
+        try:
+            if first:
+                await message.answer_photo(photo=s, caption=text)
+                first = False
+            else:
+                await message.answer_photo(photo=s)
+        except Exception as e:
+            print(f"[WELCOME] Ошибка fallback: {e}")
+
+    if first:
+        await message.answer(text)
 
 
 async def send_user_schedules(message):
@@ -916,14 +1002,73 @@ async def admin_back(message: Message, state: FSMContext):
     await message.answer("Админ-меню:", reply_markup=admin_main_kb())
 
 
+# ============= ПРОМОКОДЫ =============
+
+async def show_promos_menu(target, state: FSMContext, edit: bool = False):
+    promos = db_all("SELECT * FROM promos ORDER BY id DESC")
+    print(f"[PROMO] Промокодов в базе: {len(promos)}")
+
+    if not promos:
+        text = "🎟 Промокодов пока нет."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Создать промокод", callback_data="promo_new")],
+        ])
+    else:
+        lines = ["🎟 <b>Промокоды:</b>\n"]
+        for p in promos:
+            t = "персональный" if p["type"] == "personal" else "обычный"
+            if p["type"] == "personal":
+                uses_str = f"{p['used_count']}/{p['max_uses']}"
+            else:
+                uses_str = f"использован {p['used_count']} раз"
+            lines.append(f"• <b>{p['code']}</b> — {p['discount']}% ({t}, {uses_str})")
+        text = "\n".join(lines)
+        buttons = []
+        for p in promos:
+            buttons.append([InlineKeyboardButton(
+                text=f"🗑 Удалить {p['code']}",
+                callback_data=f"promo_del:{p['id']}"
+            )])
+        buttons.append([InlineKeyboardButton(text="➕ Создать промокод", callback_data="promo_new")])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if edit and hasattr(target, "edit_text"):
+        try:
+            await target.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await target.answer(text, reply_markup=kb)
+
+
 @router.message(IsAdmin(), F.text == "Промокод")
 async def admin_promo(message: Message, state: FSMContext):
+    await state.clear()
+    print("[PROMO] Открыто меню промокодов")
+    await show_promos_menu(message, state)
+
+
+@router.callback_query(F.data == "promo_new")
+async def promo_new(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
     await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Обычный", callback_data="promo_type:ordinary")],
         [InlineKeyboardButton(text="Персональный", callback_data="promo_type:personal")],
+        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="promo_back")],
     ])
-    await message.answer("Выберите тип промокода:", reply_markup=kb)
+    await cb.message.answer("Выберите тип промокода:", reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "promo_back")
+async def promo_back(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    await show_promos_menu(cb.message, state)
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("promo_type:"))
@@ -931,37 +1076,116 @@ async def promo_type_selected(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return
     ptype = cb.data.split(":")[1]
+    await state.clear()
     await state.update_data(promo_type=ptype)
     await state.set_state(AdminStates.promo_code)
+    print(f"[PROMO] Выбран тип: {ptype}, жду код промокода")
     await cb.message.answer("Введите код промокода:")
     await cb.answer()
 
 
 @router.message(AdminStates.promo_code)
 async def promo_code_entered(message: Message, state: FSMContext):
-    await state.update_data(promo_code=message.text.strip())
+    code = (message.text or "").strip()
+    if not code:
+        await message.answer("Введите код текстом:")
+        return
+    existing = db_one("SELECT id FROM promos WHERE code=?", (code,))
+    if existing:
+        await message.answer("Такой промокод уже есть. Введи другой код:")
+        return
+    await state.update_data(promo_code=code)
     await state.set_state(AdminStates.promo_discount)
-    await message.answer("Введите скидку в %:")
+    print(f"[PROMO] Код: {code}, жду скидку в %")
+    await message.answer("Введите скидку в % (число от 1 до 100):")
 
 
 @router.message(AdminStates.promo_discount)
 async def promo_discount_entered(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("Введите число.")
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("Введите число (например 10):")
         return
-    discount = int(message.text)
+    discount = int(text)
+    if not (1 <= discount <= 100):
+        await message.answer("Скидка должна быть от 1 до 100. Попробуйте снова:")
+        return
+
     data = await state.get_data()
-    code = data["promo_code"]; ptype = data["promo_type"]
+    code = data.get("promo_code")
+    ptype = data.get("promo_type", "ordinary")
+
+    if not code:
+        await message.answer("Сессия потеряна, начните заново: Админ-меню → Промокод")
+        await state.clear()
+        await message.answer("Админ-меню:", reply_markup=admin_main_kb())
+        return
+
     max_uses = 1 if ptype == "personal" else 999999
     try:
         db_exec("INSERT INTO promos(code, discount, type, max_uses) VALUES(?,?,?,?)",
                 (code, discount, ptype, max_uses))
-        await message.answer(f"Промокод {code} создан. Скидка {discount}%")
-    except sqlite3.IntegrityError:
-        await message.answer("Такой промокод уже есть.")
+        print(f"[PROMO] ✅ Создан промокод: {code}, скидка {discount}%, тип {ptype}")
+        await message.answer(
+            f"✅ Промокод успешно создан!\n\n"
+            f"Код: <b>{code}</b>\n"
+            f"Скидка: <b>{discount}%</b>\n"
+            f"Тип: <b>{'персональный' if ptype == 'personal' else 'обычный'}</b>"
+        )
+    except sqlite3.IntegrityError as e:
+        print(f"[PROMO] IntegrityError: {e}")
+        await message.answer("Такой промокод уже есть в базе.")
+    except Exception as e:
+        print(f"[PROMO] Ошибка создания: {e}")
+        await message.answer(f"Ошибка при создании промокода: {e}")
+
     await state.clear()
+    await show_promos_menu(message, state)
     await message.answer("Админ-меню:", reply_markup=admin_main_kb())
 
+
+@router.callback_query(F.data.startswith("promo_del:"))
+async def promo_delete(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
+    pid = int(cb.data.split(":")[1])
+    promo = db_one("SELECT * FROM promos WHERE id=?", (pid,))
+    if not promo:
+        await cb.answer("Промокод не найден", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"promo_del_ok:{pid}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="promo_back")],
+    ])
+    try:
+        await cb.message.edit_text(
+            f"Удалить промокод <b>{promo['code']}</b> ({promo['discount']}%)?",
+            reply_markup=kb
+        )
+    except Exception:
+        await cb.message.answer(
+            f"Удалить промокод <b>{promo['code']}</b> ({promo['discount']}%)?",
+            reply_markup=kb
+        )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("promo_del_ok:"))
+async def promo_delete_ok(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
+    pid = int(cb.data.split(":")[1])
+    promo = db_one("SELECT * FROM promos WHERE id=?", (pid,))
+    if not promo:
+        await cb.answer("Промокод не найден", show_alert=True)
+        return
+    db_exec("DELETE FROM promos WHERE id=?", (pid,))
+    print(f"[PROMO] Удалён промокод: {promo['code']}")
+    await cb.answer(f"Промокод {promo['code']} удалён")
+    await show_promos_menu(cb.message, state, edit=True)
+
+
+# ============= РЕКВИЗИТЫ =============
 
 @router.message(IsAdmin(), F.text == "Реквизиты")
 async def admin_set_payment(message: Message, state: FSMContext):
@@ -1004,7 +1228,7 @@ async def extra_agree(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     await state.set_state(ExtraSlotStates.enter_date)
-    await cb.message.edit_text("Введите дату в формате ДД.ММ (например 01.09):")
+    await cb.message.edit_text("Введи дату в формате ДД.ММ (например 01.09):")
     await cb.answer()
 
 
@@ -1013,11 +1237,11 @@ async def extra_enter_date(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     m = re.match(r"^(\d{1,2})[\.\s](\d{1,2})$", text)
     if not m:
-        await message.answer("Введите дату в формате ДД.ММ (например 01.09):")
+        await message.answer("Введи дату в формате ДД.ММ (например 01.09):")
         return
     day, month = int(m.group(1)), int(m.group(2))
     if not (1 <= day <= 31 and 1 <= month <= 12):
-        await message.answer("Некорректная дата. Попробуйте снова:")
+        await message.answer("Некорректная дата. Попробуй снова:")
         return
     now = datetime.now()
     year = now.year
@@ -1025,7 +1249,7 @@ async def extra_enter_date(message: Message, state: FSMContext):
         year = now.year + 1
     await state.update_data(extra_day=day, extra_month=month, extra_year=year)
     await state.set_state(ExtraSlotStates.enter_time)
-    await message.answer("Введите время в формате ЧЧ ММ (например 16 00):")
+    await message.answer("Введи время в формате ЧЧ ММ (например 16 00):")
 
 
 @router.message(ExtraSlotStates.enter_time)
@@ -1033,18 +1257,52 @@ async def extra_enter_time(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     m = re.match(r"^(\d{1,2})[:\s](\d{1,2})$", text)
     if not m:
-        await message.answer("Введите время в формате ЧЧ ММ (например 16 00):")
+        await message.answer("Введи время в формате ЧЧ ММ (например 16 00):")
         return
     hh, mm = int(m.group(1)), int(m.group(2))
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
-        await message.answer("Некорректное время. Попробуйте снова:")
+        await message.answer("Некорректное время. Попробуй снова:")
         return
+
+    data = await state.get_data()
+    day = data["extra_day"]; month = data["extra_month"]; year = data["extra_year"]
+
+    name = RU_MONTHS_NUM.get(month, "").capitalize()
+    if name:
+        m_row = db_one("SELECT id FROM months WHERE name=? AND year=?", (name, year))
+        if m_row:
+            existing = db_one(
+                "SELECT id FROM slots WHERE month_id=? AND day=? LIMIT 1",
+                (m_row["id"], day)
+            )
+            if existing:
+                await message.answer(
+                    "❌ На эту дату уже есть расписание мастера.\n"
+                    "Выбери другой день или запишись через «Записаться»."
+                )
+                await state.set_state(ExtraSlotStates.enter_date)
+                await message.answer("Введи дату в формате ДД.ММ (например 01.09):")
+                return
+
+    pending = db_one(
+        "SELECT user_id FROM extra_requests "
+        "WHERE day=? AND month=? AND year=? AND hh=? AND mm=? AND status='pending'",
+        (day, month, year, hh, mm)
+    )
+    if pending:
+        await message.answer(
+            "❌ На это время уже есть заявка на доп окошко, ожидающая подтверждения.\n"
+            "Выбери другое время."
+        )
+        await state.set_state(ExtraSlotStates.enter_time)
+        await message.answer("Введи время в формате ЧЧ ММ (например 16 00):")
+        return
+
     await state.update_data(extra_hh=hh, extra_mm=mm)
     await state.set_state(ExtraSlotStates.confirm)
-    data = await state.get_data()
     text_out = (
         f"Проверь данные:\n"
-        f"📅 {data['extra_day']:02d}.{data['extra_month']:02d}.{data['extra_year']}\n"
+        f"📅 {day:02d}.{month:02d}.{year}\n"
         f"🕐 {hh:02d}:{mm:02d}\n"
         f"💰 300 руб"
     )
